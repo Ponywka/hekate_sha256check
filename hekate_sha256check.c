@@ -34,6 +34,9 @@
 #endif
 #include <io.h>
 #include <windows.h>
+/* Older MinGW headers map these to fseeko64/ftello64 themselves. */
+#undef fseeko
+#undef ftello
 #define fseeko _fseeki64
 #define ftello _ftelli64
 #define isatty _isatty
