@@ -1,0 +1,151 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  LLVM_MINGW: llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64
+  LLVM_MINGW_URL: https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-latest
+            bin: hekate_sha256check-linux-x86_64
+          - target: linux-aarch64
+            os: ubuntu-24.04-arm
+            bin: hekate_sha256check-linux-aarch64
+          - target: windows-x86_64
+            os: ubuntu-latest
+            bin: hekate_sha256check-windows-x86_64.exe
+          - target: windows-arm64
+            os: ubuntu-latest
+            bin: hekate_sha256check-windows-arm64.exe
+          - target: darwin-universal
+            os: macos-latest
+            bin: hekate_sha256check-darwin-universal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl
+        if: startsWith(matrix.target, 'linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install MinGW
+        if: matrix.target == 'windows-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      # MinGW GCC has no Windows on ARM support, llvm-mingw does.
+      - name: Install llvm-mingw
+        if: matrix.target == 'windows-arm64'
+        run: |
+          curl -sSfL "$LLVM_MINGW_URL" | tar xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$LLVM_MINGW/bin" >> "$GITHUB_PATH"
+
+      # Static musl binaries run on any Linux distro. Built natively on each arch.
+      - name: Build (Linux)
+        if: startsWith(matrix.target, 'linux-')
+        run: musl-gcc -O2 -Wall -Wextra -Werror -static -s -o "${{ matrix.bin }}" hekate_sha256check.c
+
+      - name: Build (Windows x86_64)
+        if: matrix.target == 'windows-x86_64'
+        run: x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -Werror -static -s -municode -o "${{ matrix.bin }}" hekate_sha256check.c
+
+      - name: Build (Windows ARM64)
+        if: matrix.target == 'windows-arm64'
+        run: aarch64-w64-mingw32-clang -O2 -Wall -Wextra -Werror -static -s -municode -o "${{ matrix.bin }}" hekate_sha256check.c
+
+      # Universal binary for both Intel and Apple Silicon Macs.
+      - name: Build (macOS)
+        if: matrix.target == 'darwin-universal'
+        run: |
+          clang -O2 -Wall -Wextra -Werror -arch x86_64 -arch arm64 -mmacosx-version-min=10.13 -o "${{ matrix.bin }}" hekate_sha256check.c
+          strip "${{ matrix.bin }}"
+          lipo -info "${{ matrix.bin }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.bin }}
+          if-no-files-found: error
+
+  test:
+    name: Test ${{ matrix.target }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-latest
+            bin: hekate_sha256check-linux-x86_64
+          - target: linux-aarch64
+            os: ubuntu-24.04-arm
+            bin: hekate_sha256check-linux-aarch64
+          - target: windows-x86_64
+            os: windows-latest
+            bin: hekate_sha256check-windows-x86_64.exe
+          - target: windows-arm64
+            os: windows-11-arm
+            bin: hekate_sha256check-windows-arm64.exe
+          - target: darwin-universal
+            os: macos-latest
+            bin: hekate_sha256check-darwin-universal
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          chmod +x "${{ matrix.bin }}"
+          python tests/smoke.py "./${{ matrix.bin }}"
+
+  release:
+    name: Upload release binaries
+    if: github.event_name == 'release'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum hekate_sha256check-* > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "${{ github.event.release.tag_name }}" \
+            hekate_sha256check-* SHA256SUMS \
+            --repo "${{ github.repository }}" --clobber
